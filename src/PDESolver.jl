@@ -20,6 +20,7 @@ struct ShallowWaterParams
     ν::Float64
     h₀::Float64
     dt_max::Float64
+    h_dry::Float64
 end
 
 function ShallowWaterParams(;
@@ -27,9 +28,10 @@ function ShallowWaterParams(;
     n::Float64=0.03,
     ν::Float64=1.0,
     h₀::Float64=1e-3,
-    dt_max::Float64=0.1
+    dt_max::Float64=0.1,
+    h_dry::Float64=0.01
 )
-    return ShallowWaterParams(g, n, ν, h₀, dt_max)
+    return ShallowWaterParams(g, n, ν, h₀, dt_max, h_dry)
 end
 
 struct ShallowWaterDomain
@@ -74,7 +76,7 @@ function shallow_water_rhs!(dudt::Vector{Float64}, u::Vector{Float64},
     swp, domain = params
     Nx, Ny = domain.Nx, domain.Ny
     dx, dy = domain.dx, domain.dy
-    g, n, ν, h₀ = swp.g, swp.n, swp.ν, swp.h₀
+    g, n, ν, h₀, h_dry = swp.g, swp.n, swp.ν, swp.h₀, swp.h_dry
 
     h = reshape(u[1:Nx*Ny], Nx, Ny)
     u_vel = reshape(u[Nx*Ny+1:2*Nx*Ny], Nx, Ny)
@@ -85,17 +87,45 @@ function shallow_water_rhs!(dudt::Vector{Float64}, u::Vector{Float64},
     dvdt_vel = reshape(dudt[2*Nx*Ny+1:3*Nx*Ny], Nx, Ny)
 
     zb = domain.zb
-    h_total = max.(h, h₀)
-    h_safe = max.(h, h₀)
 
-    qx = h_safe .* u_vel
-    qy = h_safe .* v_vel
+    for idx in eachindex(h)
+        if h[idx] < h₀
+            h[idx] = h₀
+        end
+        if isnan(h[idx]) || isnan(u_vel[idx]) || isnan(v_vel[idx])
+            h[idx] = h₀
+            u_vel[idx] = 0.0
+            v_vel[idx] = 0.0
+        end
+    end
 
-    @inline function gradient_x(f::Matrix{Float64}, dx::Float64)
+    wet = h .>= h_dry
+
+    h_safe = max.(h, h_dry)
+
+    u_vel_wet = u_vel .* wet
+    v_vel_wet = v_vel .* wet
+
+    qx = h_safe .* u_vel_wet
+    qy = h_safe .* v_vel_wet
+
+    @inline function minmod(a::Float64, b::Float64)
+        if a * b <= 0.0
+            return 0.0
+        elseif abs(a) < abs(b)
+            return a
+        else
+            return b
+        end
+    end
+
+    @inline function gradient_x_limited(f::Matrix{Float64}, dx::Float64)
         grad = zeros(Nx, Ny)
         for j in 1:Ny
             for i in 2:Nx-1
-                grad[i, j] = (f[i+1, j] - f[i-1, j]) / (2 * dx)
+                forward = (f[i+1, j] - f[i, j]) / dx
+                backward = (f[i, j] - f[i-1, j]) / dx
+                grad[i, j] = minmod(forward, backward)
             end
             grad[1, j] = (f[2, j] - f[1, j]) / dx
             grad[Nx, j] = (f[Nx, j] - f[Nx-1, j]) / dx
@@ -103,11 +133,13 @@ function shallow_water_rhs!(dudt::Vector{Float64}, u::Vector{Float64},
         return grad
     end
 
-    @inline function gradient_y(f::Matrix{Float64}, dy::Float64)
+    @inline function gradient_y_limited(f::Matrix{Float64}, dy::Float64)
         grad = zeros(Nx, Ny)
         for i in 1:Nx
             for j in 2:Ny-1
-                grad[i, j] = (f[i, j+1] - f[i, j-1]) / (2 * dy)
+                forward = (f[i, j+1] - f[i, j]) / dy
+                backward = (f[i, j] - f[i, j-1]) / dy
+                grad[i, j] = minmod(forward, backward)
             end
             grad[i, 1] = (f[i, 2] - f[i, 1]) / dy
             grad[i, Ny] = (f[i, Ny] - f[i, Ny-1]) / dy
@@ -126,29 +158,41 @@ function shallow_water_rhs!(dudt::Vector{Float64}, u::Vector{Float64},
         return lap
     end
 
-    dqx_dx = gradient_x(qx, dx)
-    dqy_dy = gradient_y(qy, dy)
+    dqx_dx = gradient_x_limited(qx, dx)
+    dqy_dy = gradient_y_limited(qy, dy)
 
     dhdt .= -(dqx_dx + dqy_dy)
 
-    d(qx²/h_safe)_dx = gradient_x(qx.^2 ./ h_safe, dx)
-    d(qx*qy/h_safe)_dy = gradient_y(qx .* qy ./ h_safe, dy)
-    d(gh²/2 + g*zb*h_safe)_dx = gradient_x(g .* (h_safe.^2 / 2 + zb .* h_safe), dx)
+    pressure_x = gradient_x_limited(g .* (h_safe.^2 / 2 .+ zb .* h_safe), dx)
+    advect_xx = gradient_x_limited(qx.^2 ./ h_safe, dx)
+    advect_xy = gradient_y_limited(qx .* qy ./ h_safe, dy)
 
-    mag_vel = sqrt.(u_vel.^2 + v_vel.^2)
-    stress_x = g * n^2 .* mag_vel .* u_vel ./ max.(h_safe, h₀).^(1/3)
+    mag_vel = sqrt.(u_vel_wet.^2 + v_vel_wet.^2)
+    friction_x = g * n^2 .* mag_vel .* u_vel_wet ./ (h_safe.^(4/3))
+    friction_x .*= wet
 
-    dudt_vel .= -(d(qx²/h_safe)_dx + d(qx*qy/h_safe)_dy + d(gh²/2 + g*zb*h_safe)_dx) ./ h_safe - stress_x + ν .* laplacian(u_vel, dx, dy)
+    lap_u = laplacian(u_vel_wet, dx, dy)
 
-    d(qx*qy/h_safe)_dx = gradient_x(qx .* qy ./ h_safe, dx)
-    d(qy²/h_safe)_dy = gradient_y(qy.^2 ./ h_safe, dy)
-    d(gh²/2 + g*zb*h_safe)_dy = gradient_y(g .* (h_safe.^2 / 2 + zb .* h_safe), dy)
+    dudt_vel .= wet .* (-(advect_xx + advect_xy + pressure_x) ./ h_safe - friction_x + ν .* lap_u)
 
-    stress_y = g * n^2 .* mag_vel .* v_vel ./ max.(h_safe, h₀).^(1/3)
+    pressure_y = gradient_y_limited(g .* (h_safe.^2 / 2 .+ zb .* h_safe), dy)
+    advect_yx = gradient_x_limited(qx .* qy ./ h_safe, dx)
+    advect_yy = gradient_y_limited(qy.^2 ./ h_safe, dy)
 
-    dvdt_vel .= -(d(qx*qy/h_safe)_dx + d(qy²/h_safe)_dy + d(gh²/2 + g*zb*h_safe)_dy) ./ h_safe - stress_y + ν .* laplacian(v_vel, dx, dy)
+    friction_y = g * n^2 .* mag_vel .* v_vel_wet ./ (h_safe.^(4/3))
+    friction_y .*= wet
+
+    lap_v = laplacian(v_vel_wet, dx, dy)
+
+    dvdt_vel .= wet .* (-(advect_yx + advect_yy + pressure_y) ./ h_safe - friction_y + ν .* lap_v)
 
     apply_boundary_conditions!(dhdt, dudt_vel, dvdt_vel, h, u_vel, v_vel, Nx, Ny, h₀)
+
+    for idx in eachindex(dudt)
+        if isnan(dudt[idx])
+            dudt[idx] = 0.0
+        end
+    end
 
     return nothing
 end

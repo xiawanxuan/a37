@@ -213,11 +213,26 @@ function inversion_objective(
     observations::Matrix{Float64};
     verbose::Bool=false
 )
+    lower = inv_params.lower_bounds
+    upper = inv_params.upper_bounds
+
+    barrier = 0.0
     for i in 1:length(params_vec)
-        if params_vec[i] < inv_params.lower_bounds[i] || params_vec[i] > inv_params.upper_bounds[i]
-            return 1e10
+        margin_lo = (params_vec[i] - lower[i]) / (upper[i] - lower[i])
+        margin_hi = (upper[i] - params_vec[i]) / (upper[i] - lower[i])
+        if margin_lo <= 0.0 || margin_hi <= 0.0
+            return 1e10 + 1e6 * sum(abs.(params_vec - (lower + upper) / 2))
+        end
+        if margin_lo < 0.05
+            barrier -= 1e-2 * log(margin_lo / 0.05)
+        end
+        if margin_hi < 0.05
+            barrier -= 1e-2 * log(margin_hi / 0.05)
         end
     end
+
+    param_scales = (upper - lower)
+    normalized_residual = (params_vec - inv_params.initial_params) ./ param_scales
 
     paleo_params = param_vec_to_struct(params_vec, inv_params.param_names)
 
@@ -226,19 +241,28 @@ function inversion_objective(
         simulated = compute_inundation_observations(sol, domain_with_sites, sites, eval_times)
 
         residuals = (simulated - observations)
+        obs_range = maximum(observations) - minimum(observations)
+        if obs_range < 1e-8
+            obs_range = 1.0
+        end
+        normalized_res = residuals / obs_range
         weights = (observations .> 0) .+ 0.1
-        mse = sum(weights .* residuals.^2) / sum(weights)
+        mse = sum(weights .* normalized_res.^2) / sum(weights)
 
-        regularization = 1e-4 * sum((params_vec - inv_params.initial_params).^2)
+        regularization = 1e-2 * sum(normalized_residual.^2)
 
-        total_loss = mse + regularization
+        total_loss = mse + regularization + barrier
+
+        if isnan(total_loss) || isinf(total_loss)
+            return 1e10
+        end
 
         if verbose
             @printf("Params: ")
             for (name, val) in zip(inv_params.param_names, params_vec)
                 @printf("%s=%.3f ", name, val)
             end
-            @printf("Loss: %.6f\n", total_loss)
+            @printf("Loss: %.6f (mse=%.6f reg=%.6f bar=%.6f)\n", total_loss, mse, regularization, barrier)
         end
 
         return total_loss
@@ -275,27 +299,35 @@ function invert_paleoriver_params(
     upper = inv_params.upper_bounds
     initial_x = inv_params.initial_params
 
+    param_scales = (upper - lower)
+    normalized_lower = zeros(length(lower))
+    normalized_upper = ones(length(upper))
+    normalized_init = (initial_x - lower) ./ param_scales
+
+    function normalized_objective(x_norm::Vector{Float64})
+        x_physical = lower + x_norm .* param_scales
+        return inversion_objective(
+            x_physical, inv_params, domain, sites, tspan, eval_times, observations;
+            verbose=false
+        )
+    end
+
     inner_optimizer = LBFGS(
         m=10,
         linesearch=LineSearches.BackTracking(order=3),
-        alphaguess=LineSearches.InitialStatic()
-    )
-
-    objective(x) = inversion_objective(
-        x, inv_params, domain, sites, tspan, eval_times, observations;
-        verbose=false
+        alphaguess=LineSearches.InitialStatic(alpha=0.01)
     )
 
     result = optimize(
-        objective,
-        lower,
-        upper,
-        initial_x,
+        normalized_objective,
+        normalized_lower,
+        normalized_upper,
+        normalized_init,
         Fminbox(inner_optimizer),
         Optim.Options(
             iterations=inv_params.max_iterations,
             f_tol=inv_params.tolerance,
-            g_tol=1e-5,
+            g_tol=1e-3,
             show_trace=verbose,
             extended_trace=true,
             callback=callback,
@@ -303,7 +335,8 @@ function invert_paleoriver_params(
         )
     )
 
-    optimized_params = Optim.minimizer(result)
+    optimized_normalized = Optim.minimizer(result)
+    optimized_params = lower + optimized_normalized .* param_scales
     min_obj = Optim.minimum(result)
     iterations = Optim.iterations(result)
     converged = Optim.converged(result)

@@ -164,11 +164,25 @@ function plot_site_evolution(
     domain::ShallowWaterDomain,
     sites::Vector{ArchaeologicalSite},
     eval_times::Vector{Float64};
+    chrono_times::Union{Vector{Float64}, Nothing}=nothing,
     title::String="Site Inundation Risk Evolution",
     cmap::Symbol=:plasma
 )
     n_times = length(eval_times)
     n_sites = length(sites)
+
+    if chrono_times === nothing
+        chrono_times = Float64[]
+        for site in sites
+            push!(chrono_times, site.start_age)
+            push!(chrono_times, site.end_age)
+        end
+        chrono_min = minimum(chrono_times)
+        chrono_max = maximum(chrono_times)
+        chrono_times = collect(range(chrono_min, chrono_max, length=n_times))
+    end
+
+    @assert length(chrono_times) == n_times "chrono_times length must match eval_times length"
 
     risk_matrix = zeros(n_times, n_sites)
 
@@ -182,7 +196,7 @@ function plot_site_evolution(
         end
     end
 
-    p1 = heatmap(eval_times, 1:n_sites, risk_matrix',
+    p1 = heatmap(chrono_times, 1:n_sites, risk_matrix',
                  xlabel="Time (years BP)",
                  ylabel="Sites",
                  yticks=(1:n_sites, [s.id for s in sites]),
@@ -192,7 +206,7 @@ function plot_site_evolution(
                  aspect_ratio=:auto,
                  size=(800, 400))
 
-    p2 = plot(eval_times, risk_matrix,
+    p2 = plot(chrono_times, risk_matrix,
               xlabel="Time (years BP)",
               ylabel="Inundation Risk",
               title="Risk Time Series",
